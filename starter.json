@@ -1,0 +1,21 @@
+{
+  "name": "Rhythm Battle",
+  "genre": "word",
+  "dim": "2D",
+  "mode": "Versus",
+  "players": "2–4",
+  "hook": "Same beat, same notes. Out-hit your friends.",
+  "how": "A fresh beat is made for every round, and everyone gets the same notes on 4 lanes. Hit each note as it reaches the line: perfect timing scores most, and a long combo multiplies it. Highest score wins.",
+  "controls": "D F J K (or the arrow keys); on phones, tap the lanes",
+  "uses": [
+    ["Host-run rounds", "One player's browser counts in each song, ends it and posts the results; if it leaves, the next player takes over."],
+    ["Leaderboard", "Each player's best score."],
+    ["Bots", "Bot players hit (and miss) along with you until enough people join."],
+    ["Live sync", "Everyone's score and combo climb on every screen as they play."]
+  ],
+  "ideas": [
+    "Add hold notes you have to keep pressed",
+    "Make the songs faster every round",
+    "Give each player an avatar that dances when they hit"
+  ]
+}

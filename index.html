@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rhythm Battle</title>
+<style>
+  :root { --ink: #f4f0ff; --dim: #a59fc9; --gold: #ffd23f; --ok: #7dff6a; --bad: #ff4d6d; }
+  html, body { margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none; background: #0a0818; }
+  body { color: var(--ink); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+  [hidden] { display: none !important; }
+  .hud { position: fixed; pointer-events: none; text-shadow: 0 1px 3px #000c; }
+  #hint { left: 12px; right: 12px; text-align: center; font-weight: 700; font-size: 14px; color: var(--gold); }
+  #net { bottom: max(8px, env(safe-area-inset-bottom)); left: max(12px, env(safe-area-inset-left)); font-size: 12px; color: var(--dim); }
+  #over { position: fixed; inset: 0; display: grid; place-items: center; background: #0a0818b0; }
+  .card { box-sizing: border-box; width: min(400px, 92vw); max-height: 86vh; overflow: auto; padding: 18px 20px; border-radius: 16px; background: #191433; border: 1px solid #ffffff2a; text-align: center; box-shadow: 0 0 40px #b26bff44; }
+  .card h2 { margin: 0 0 4px; font-size: 26px; }
+  .card .sub { margin: 0 0 10px; color: var(--dim); font-size: 13px; }
+  .card h3 { margin: 14px 0 4px; font-size: 14px; color: var(--gold); text-align: left; }
+  .card ol { margin: 0; padding-left: 24px; font-size: 14px; text-align: left; }
+  .card li { padding: 2px 0; } .card li span { float: right; font-variant-numeric: tabular-nums; }
+  .card li small { display: block; color: var(--dim); font-size: 12px; }
+  .card li.me { color: var(--gold); font-weight: 700; }
+  .card p { margin: 10px 0 0; font-size: 13px; opacity: .8; }
+  button.go { width: 100%; min-height: 48px; margin-top: 14px; border: 0; border-radius: 12px; background: #b26bff; color: #fff; font: 800 17px system-ui, sans-serif; cursor: pointer; }
+</style>
+<script src="https://cdn.multiplayeragent.com/sdk/mp.global.js"></script>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div class="hud" id="hint"></div>
+<div class="hud" id="net">Connecting…</div>
+<div id="over" hidden><div class="card">
+  <h2 id="winner"></h2><div class="sub" id="combo"></div><ol id="results"></ol>
+  <h3>High scores</h3><ol id="board"><li>Loading…</li></ol>
+  <button class="go" id="again">Play again</button><p id="next"></p>
+</div></div>
+<script>
+/* ═══ RHYTHM BATTLE · a Multiplayer Agent starter ═════════════════════════════════════
+ * Hit the notes on 4 lanes as the beat plays. Same song, same notes for everyone.
+ * Versus, 2–4 players; bots fill empty seats.
+ *
+ * WHERE THINGS ARE (search for the "── " headers):
+ *   CONFIG ........ timing windows, scoring, song length, note speed, bots
+ *   CONNECTION .... MP_CONNECT, joining, the offline room, who is host
+ *   SONG .......... the seeded song: tempo, chords, drums, bass and the melody that IS
+ *                   the note chart. Same seed = same song and same notes everywhere.
+ *   MUSIC ......... WebAudio: the drums, bass and pads, scheduled just ahead of time,
+ *                   and the melody note you play when you hit
+ *   ROUND (HOST) .. the phases (count, play, done), results, the bots. Only the host writes these.
+ *   MY PLAY ....... judging your hits (perfect / great / good / miss), combo, score
+ *   DRAW .......... the note highway, the players' scores, effects
+ *   HUD & RESULTS . hint line, results card, leaderboard
+ *   INPUT ......... D F J K (or the arrow keys), or tap a lane
+ *
+ * HOW THE MULTIPLAYER WORKS (a relay room: no server code):
+ *   - The round lives in ONE shared field, `round`: {id, v, phase, seed, startAt, endsAt, res}.
+ *     Only the HOST writes it; `v` goes up on every write. startAt is a timestamp, so every
+ *     player's song starts together, and the song (and its notes) come from mulberry32(seed).
+ *   - The HOST is the lowest sessionId among live players (heartbeat seen in the last 3s),
+ *     worked out every frame. It counts in, ends the song, writes the results, and plays the
+ *     bots: their scores go in `bots` a few times a second. A new host adopts both.
+ *   - Each player judges its OWN hits and writes `s` {r, sc, cb, mx, p, g, o, m} (song id,
+ *     score, combo, best combo, perfect/great/good/miss counts) ~6 times a second, `hb`
+ *     (heartbeat) once a second, `rdy` (Play again) and `n`/`c` (name, color). No intents:
+ *     nobody's hit changes anyone else's score.
+ *   - Someone who arrives mid-song plays from where the song is.
+ *   - ?attract plays offline, bots plus an autopilot for you, from the busy finale of a song.
+ *   - Leaderboard "rhythm-score": each player's best score.
+ */
+
+// ── CONFIG ──────────────────────────────────────────────────────────────────────────
+const CONFIG = {
+  seats: 4,             // bots fill the room up to this many players
+  countdown: 4000,      // ms of count-in before the song
+  resultsMs: 10000,     // ms on the results card before the next song
+  bars: 18,             // song length in bars of 4 beats (~35s)
+  leadMs: 1500,         // how long a note is on screen before it reaches the line
+  perfect: 50,          // ms either side of the beat for PERFECT...
+  great: 95,            // ...GREAT...
+  good: 140,            // ...and GOOD; later than this is a miss
+  points: { P: 300, G: 200, O: 100, M: 0 }, // per hit, times the combo multiplier
+  multEvery: 10,        // the multiplier goes up every this many hits in a row...
+  multMax: 4,           // ...up to this
+  inputOffsetMs: 0,     // add this to every hit if your notes feel late (Bluetooth headphones: try -80)
+  botSkill: [0.55, 0.9],// 0..1: how often a bot lands perfects instead of missing
+  sendMs: 160,          // how often your score goes out
+  volume: 0.5,
+  board: "rhythm-score",
+};
+const LANE_COLORS = ["#ff4d8d", "#ffd23f", "#3df2ff", "#7dff6a"];
+const KEYS = { d: 0, f: 1, j: 2, k: 3, arrowleft: 0, arrowdown: 1, arrowup: 2, arrowright: 3 };
+const BOT_NAMES = ["DJ Beep", "Bassline", "Snare Bear", "Hi-Hat", "Synthia", "Groovy"];
+const COLORS = ["#b26bff", "#3fa7ff", "#ff8c42", "#4ee08a", "#ff6fd8", "#ffd23f", "#3fe0c5", "#ff4d6d"];
+
+// ── CONNECTION ──────────────────────────────────────────────────────────────────────
+// The builder fills these in for this game. Downloaded from GitHub? Put your own pk_ key here.
+const MP_CONNECT = {
+  key: 'pk_REPLACE_ME',
+  room: 'rhythm-battle',
+  endpoint: 'wss://live.multiplayeragent.com',
+  apiUrl: 'https://api.multiplayeragent.com',
+};
+const ATTRACT = new URLSearchParams(location.search).has("attract");
+
+/** Same shape as the SDK client, kept in this tab: offline play and ?attract. */
+function localRoom() {
+  const id = "local", state = { entities: { players: { [id]: {} } }, shared: {} }, subs = [];
+  let queued = false;
+  const emit = () => { if (!queued) { queued = true; queueMicrotask(() => { queued = false; subs.forEach((f) => f(state)); }); } };
+  const put = (o, k, v) => { if (typeof k === "object") Object.assign(o, k); else o[k] = v; emit(); };
+  return {
+    sessionId: id, state, offline: true,
+    me: { set: (k, v) => put(state.entities.players[id], k, v) },
+    setShared: (k, v) => put(state.shared, k, v),
+    onState: (f) => { subs.push(f); f(state); }, onJoin() {}, onLeave() {}, on() {}, send() {},
+    onDisconnect() {}, onReconnect() {}, leave: async () => {},
+  };
+}
+async function connect() {
+  if (ATTRACT || typeof MP === "undefined") return localRoom();
+  try {
+    const mp = await Promise.race([MP.join({ ...MP_CONNECT }), new Promise((_, no) => setTimeout(() => no(new Error("timed out")), 10000))]);
+    window.mp = mp; // the builder calls window.mp.leave() when the page closes
+    return mp;
+  } catch (e) {
+    console.warn("Playing offline:", e && e.message);
+    return localRoom();
+  }
+}
+const parse = (v, fb) => { if (typeof v !== "string") return fb; try { return JSON.parse(v); } catch { return fb; } };
+const memo = new Map();
+/** A JSON field, parsed once per change (read-only: never mutate what this returns). */
+function cached(key, raw, fb) { const m = memo.get(key); if (m && m.raw === raw) return m.v; const v = parse(raw, fb); memo.set(key, { raw, v }); return v; }
+let net = null, S = { entities: { players: {} }, shared: {} }, netDown = false;
+const seenHb = new Map(); // sessionId -> { hb, at } on OUR clock
+/** Players whose heartbeat moved in the last 3s (plus us), sorted by sessionId. */
+function livePlayers() {
+  const now = performance.now(), out = [];
+  for (const [id, p] of Object.entries(S.entities.players || {})) {
+    const s = seenHb.get(id);
+    if (!s || s.hb !== p.hb) seenHb.set(id, { hb: p.hb, at: now });
+    if (id === net.sessionId || now - seenHb.get(id).at < 3000) out.push(id);
+  }
+  return out.sort();
+}
+const isHost = () => livePlayers()[0] === net.sessionId;
+const humans = () => livePlayers(); // (in ?attract you play too, on autopilot)
+
+// ── SONG ────────────────────────────────────────────────────────────────────────────
+function mulberry32(a) { return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const PROGRESSIONS = [[0, 8, 3, 10], [0, 5, 8, 7], [0, 10, 8, 10], [0, 3, 10, 5], [0, 8, 5, 7]]; // minor-key chord roots
+const CHORD = { 0: [0, 3, 7], 3: [3, 7, 10], 5: [5, 8, 12], 7: [7, 11, 14], 8: [8, 12, 15], 10: [10, 14, 17] };
+const SCALE = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22]; // two octaves of minor pentatonic: the melody's notes, low to high
+// each section: bars, how busy the notes are (0 = none: the count-in groove), drums
+const SECTIONS = [{ bars: 2, dens: 0 }, { bars: 4, dens: 1 }, { bars: 4, dens: 2 }, { bars: 4, dens: 1.5 }, { bars: 4, dens: 3 }];
+const songMemo = new Map();
+/** The whole song from its seed: tempo, music events and the note chart. Everyone builds the same one. */
+function songOf(seed) {
+  if (songMemo.has(seed)) return songMemo.get(seed);
+  const rnd = mulberry32(seed), pick = (a) => a[Math.floor(rnd() * a.length)];
+  const bpm = pick([100, 108, 116, 124, 132]), step = 60000 / bpm / 4; // ms per 16th note
+  const root = 45 + Math.floor(rnd() * 7), prog = pick(PROGRESSIONS); // root: a MIDI note around A2
+  const name = pick(["Neon", "Midnight", "Electric", "Velvet", "Cosmic", "Turbo", "Crystal", "Laser"]) + " " + pick(["Drift", "Pulse", "Heart", "Groove", "Rush", "Dreams", "Fever", "Echo"]);
+  const music = [], notes = [], lastInLane = [-9, -9, -9, -9];
+  let bar = 0, idx = 4, lane = 1, run = 0;
+  for (const sec of SECTIONS) for (let sb = 0; sb < sec.bars && bar < CONFIG.bars; sb++, bar++) {
+    const chord = prog[bar % 4], tones = CHORD[chord], d = sec.dens;
+    music.push({ t: bar * 16 * step, k: "pad", m: tones.map((x) => root + 12 + x), len: 16 * step });
+    for (let s = 0; s < 16; s++) {
+      const t = (bar * 16 + s) * step, abs = bar * 16 + s;
+      if (s % 8 === 0 || (d >= 3 && s % 4 === 0) || (d >= 2 && s === 10)) music.push({ t, k: "kick" });
+      if (s % 8 === 4 && d > 0) music.push({ t, k: "snare" });
+      if (s % 2 === 0 || (d >= 3 && rnd() < 0.5)) music.push({ t, k: "hat", open: s % 4 === 2 });
+      if (s % 2 === 0 && d > 0) music.push({ t, k: "bass", m: root + chord + (s % 4 === 2 && d >= 2 ? 12 : 0) });
+      // the melody: busier sections play on more of the 16ths; strong beats lean on chord tones
+      const want = d === 0 ? 0 : s % 4 === 0 ? 0.9 : s % 2 === 0 ? [0, 0.3, 0.55, 0.8][Math.ceil(d)] : d >= 3 ? 0.3 : 0;
+      if (rnd() >= want) continue;
+      const prev = idx;
+      idx = Math.max(0, Math.min(SCALE.length - 1, idx + Math.round((rnd() - 0.5) * 4)));
+      if (s % 4 === 0) { const near = SCALE.map((x, i) => [i, Math.min(...tones.map((c) => Math.abs(((x - c) % 12 + 12) % 12)))]).filter((x) => x[1] === 0).map((x) => x[0]); if (near.length) idx = near.reduce((a, b) => (Math.abs(b - idx) < Math.abs(a - idx) ? b : a)); }
+      // lanes follow the tune: up = a lane to the right, down = to the left, bouncing off the edges
+      const move = idx > prev ? 1 + (idx - prev > 2) : idx < prev ? -1 - (prev - idx > 2) : run >= 2 ? (rnd() < 0.5 ? 1 : -1) : 0;
+      let next = lane + move; if (next > 3) next = 6 - next; if (next < 0) next = -next;
+      next = Math.max(0, Math.min(3, next));
+      if (abs - lastInLane[next] < 2) next = [1, 0, 3, 2][next]; // never two 16ths in a row on one lane
+      if (abs - lastInLane[next] < 2) continue;
+      run = next === lane ? run + 1 : 0; lane = next; lastInLane[lane] = abs;
+      notes.push({ t, l: lane, m: root + 24 + SCALE[idx] });
+      if (d >= 3 && s === 0) { const l2 = (lane + 2) % 4; lastInLane[l2] = abs; notes.push({ t, l: l2, m: root + 24 + tones[1] }); } // a chord: two lanes at once
+    }
+  }
+  notes.sort((a, b) => a.t - b.t || a.l - b.l);
+  music.sort((a, b) => a.t - b.t);
+  const byLane = [[], [], [], []];
+  notes.forEach((n, i) => byLane[n.l].push(i));
+  const song = { seed, bpm, step, name, notes, byLane, music, length: CONFIG.bars * 16 * step };
+  songMemo.set(seed, song);
+  return song;
+}
+
+// ── MUSIC ───────────────────────────────────────────────────────────────────────────
+let audio = null, master = null, noise = null;
+const music = { seed: -1, base: 0, next: 0 }; // base: the AudioContext time of song time 0
+function unlockAudio() {
+  if (audio || ATTRACT) return;
+  try {
+    audio = new AudioContext();
+    const comp = audio.createDynamicsCompressor(); master = audio.createGain(); master.gain.value = CONFIG.volume;
+    master.connect(comp).connect(audio.destination);
+    noise = audio.createBuffer(1, audio.sampleRate, audio.sampleRate);
+    const ch = noise.getChannelData(0); for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+    music.seed = -1; // (re)line up with the song on the next frame
+  } catch { audio = null; }
+}
+const hz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+function voice(type, freq, at, len, vol, filter) {
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, at);
+  g.gain.setValueAtTime(0.0001, at); g.gain.exponentialRampToValueAtTime(vol, at + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+  if (filter) { const f = audio.createBiquadFilter(); f.type = "lowpass"; f.frequency.value = filter; o.connect(f).connect(g); } else o.connect(g);
+  g.connect(master); o.start(at); o.stop(at + len + 0.05);
+  return o;
+}
+function hiss(at, len, vol, hp) {
+  const src = audio.createBufferSource(), f = audio.createBiquadFilter(), g = audio.createGain();
+  src.buffer = noise; f.type = "highpass"; f.frequency.value = hp;
+  g.gain.setValueAtTime(vol, at); g.gain.exponentialRampToValueAtTime(0.0001, at + len);
+  src.connect(f).connect(g).connect(master); src.start(at, Math.random() * 0.5); src.stop(at + len + 0.02);
+}
+function playEvent(e, at, song) {
+  if (e.k === "kick") { const o = voice("sine", 150, at, 0.28, 0.9); o.frequency.exponentialRampToValueAtTime(42, at + 0.12); }
+  else if (e.k === "snare") { hiss(at, 0.16, 0.35, 1200); voice("triangle", 190, at, 0.1, 0.25); }
+  else if (e.k === "hat") hiss(at, e.open ? 0.12 : 0.04, 0.12, 7000);
+  else if (e.k === "bass") voice("sawtooth", hz(e.m), at, song.step * 1.8 / 1000, 0.22, 500);
+  else if (e.k === "pad") for (const m of e.m) voice("triangle", hz(m), at, e.len / 1000, 0.035);
+}
+/** Called every frame: queue the backing track ~0.2s ahead on the audio clock, lined up with the song's startAt. */
+function scheduleMusic(s, now) {
+  if (!audio || !s || s.phase === "done") return;
+  const song = songOf(s.seed), t = Date.now() - s.startAt;
+  if (music.seed !== s.seed + s.id * 7919) { // a new song (or sound just turned on): line the audio clock up with the song clock
+    music.seed = s.seed + s.id * 7919;
+    music.base = audio.currentTime - t / 1000 - (audio.outputLatency || audio.baseLatency || 0);
+    music.next = song.music.findIndex((e) => e.t >= t); if (music.next < 0) music.next = song.music.length;
+  }
+  while (music.next < song.music.length && song.music[music.next].t < t + 200) {
+    const e = song.music[music.next++], at = music.base + e.t / 1000;
+    if (at >= audio.currentTime - 0.01) playEvent(e, Math.max(at, audio.currentTime), song);
+  }
+}
+/** The melody note you just hit (a missed note stays silent: you hear what you play). */
+function keysound(n, j) { if (audio) { const at = audio.currentTime; voice("square", hz(n.m), at, 0.22, j === "P" ? 0.12 : 0.08, 2400); voice("triangle", hz(n.m) * 2, at, 0.12, 0.05); } }
+function blip(f0, f1, len, vol) { if (!audio) return; const o = voice("sine", f0, audio.currentTime, len, vol); o.frequency.exponentialRampToValueAtTime(f1, audio.currentTime + len); }
+
+// ── ROUND (HOST) ────────────────────────────────────────────────────────────────────
+const host = { last: null, wasHost: false, bots: [], songId: 0, lastBots: 0 };
+/** The round as state has it, or the host's own newer write that hasn't come back yet. `v` only goes up. */
+function round() {
+  const s = cached("round", S.shared.round, null);
+  return host.last && isHost() && (!s || host.last.v > s.v) ? host.last : s;
+}
+function writeRound(s) { s = { ...s, v: (round()?.v ?? 0) + 1 }; host.last = s; net.setShared("round", JSON.stringify(s)); return s; }
+function newRound(id) {
+  const seed = (Math.random() * 1e9) | 0, skip = ATTRACT ? 13 * 16 * songOf(seed).step : 0; // ?attract starts at the busy finale
+  return { id, phase: "count", seed, startAt: Date.now() + CONFIG.countdown - skip, endsAt: 0, res: [] };
+}
+const blank = () => ({ sc: 0, cb: 0, mx: 0, p: 0, g: 0, o: 0, m: 0 });
+/** Become host: take over the bots exactly as state has them. */
+function adopt() {
+  host.wasHost = true;
+  const s = round(), b = cached("bots", S.shared.bots, null);
+  host.songId = s ? s.id : 0;
+  host.bots = s && b && b.r === s.id && Array.isArray(b.list) ? b.list.map((x) => ({ ...x })) : [];
+}
+function fillBots() {
+  const want = Math.max(0, CONFIG.seats - humans().length);
+  if (host.bots.length > want) host.bots.length = want;
+  const taken = new Set([...Object.values(S.entities.players || {}).map((p) => p.c), myColor]);
+  while (host.bots.length < want) {
+    const names = new Set(host.bots.map((b) => b.n)), colors = new Set([...taken, ...host.bots.map((b) => b.c)]), [lo, hi] = CONFIG.botSkill;
+    host.bots.push({ i: "bot" + host.bots.length, n: BOT_NAMES.find((n) => !names.has(n)) || "Bot", c: COLORS.find((c) => !colors.has(c)) || "#ccc", k: Math.round((lo + Math.random() * (hi - lo)) * 100) / 100, ni: 0, ...blank() });
+  }
+}
+/** Bots "play" each note as it passes the line: a roll against their skill picks the judgement. */
+function driveBots(s) {
+  const chart = songOf(s.seed).notes, t = Date.now() - s.startAt;
+  for (const b of host.bots) {
+    if (!b.ni) while (b.ni < chart.length && chart[b.ni].t < t - CONFIG.good) b.ni++; // a bot added mid-song starts here
+    while (b.ni < chart.length && chart[b.ni].t + 40 <= t) {
+      const r = Math.random(), miss = (1 - b.k) * 0.3, perf = b.k * 0.62;
+      score(b, r < miss ? "M" : r < miss + perf ? "P" : r < miss + perf + 0.22 ? "G" : "O");
+      b.ni++;
+    }
+  }
+}
+/** Everyone in this song: { id, name, color, sc, cb, mx, p, g, o, m, mine, bot }. */
+function players(s) {
+  const out = [];
+  for (const id of humans()) {
+    if (id === net.sessionId) { if (me.songId === s.id) out.push({ id, name: myName, color: myColor, ...me.st, mine: true }); continue; }
+    const p = S.entities.players[id] || {}, st = cached("s:" + id, p.s, null);
+    if (st && st.r === s.id) out.push({ id, name: String(p.n || "Player"), color: p.c || "#ccc", ...st });
+  }
+  const bots = isHost() ? host.bots : (() => { const b = cached("bots", S.shared.bots, null); return b && b.r === s.id && Array.isArray(b.list) ? b.list : []; })();
+  for (const b of bots) out.push({ id: b.i, name: b.n, color: b.c, sc: b.sc, cb: b.cb, mx: b.mx, p: b.p, g: b.g, o: b.o, m: b.m, bot: true });
+  return out.sort((a, b) => b.sc - a.sc || b.mx - a.mx);
+}
+const botColors = () => { const s = round(); return s ? players(s).filter((x) => x.bot).map((x) => x.color) : []; };
+const accuracy = (x) => { const n = x.p + x.g + x.o + x.m; return n ? Math.round((100 * (x.p + x.g * 0.7 + x.o * 0.4)) / n) : 0; };
+
+function hostTick(now) {
+  if (!host.wasHost) adopt();
+  let s = round();
+  const t = Date.now();
+  if (!s) s = writeRound(newRound(1));
+  if (host.songId !== s.id) { host.songId = s.id; host.bots = []; } // a new song: fresh bots
+  if (s.phase === "count") {
+    fillBots();
+    if (t >= s.startAt) s = writeRound({ ...s, phase: "play", endsAt: s.startAt + songOf(s.seed).length + 1500 });
+  } else if (s.phase === "play") {
+    driveBots(s);
+    if (t >= s.endsAt) s = writeRound({ ...s, phase: "done", endsAt: t + CONFIG.resultsMs, res: players(s).slice(0, 8).map((x) => [x.id, String(x.name).slice(0, 14), x.color, x.sc, x.mx, accuracy(x), x.p]) });
+  } else if (s.phase === "done") {
+    const people = humans(), ready = people.length && people.every((id) => (id === net.sessionId ? me.ready : (S.entities.players[id] || {}).rdy) === s.id);
+    if (t > s.endsAt || ready) s = writeRound(newRound(s.id + 1));
+  }
+  if (now - host.lastBots > (s.phase === "play" ? 250 : 800)) { host.lastBots = now; net.setShared("bots", JSON.stringify({ r: s.id, list: host.bots })); }
+}
+
+// ── MY PLAY ─────────────────────────────────────────────────────────────────────────
+let myName = "";
+try { myName = localStorage.getItem("mpa-name") || ""; } catch {}
+myName = myName || ["Funky", "Groovy", "Electric", "Smooth", "Cosmic", "Jazzy"][Math.floor(Math.random() * 6)] + " " + ["Beat", "Drummer", "Keys", "Bass", "Vibes"][Math.floor(Math.random() * 5)];
+let myColor = COLORS[0]; // picked on join: the first color nobody in the room has
+const me = { songId: -1, st: blank(), judged: null, next: [0, 0, 0, 0], late: false, lastSend: 0, lastJson: "", ready: 0, submitted: -1, best: 0 };
+/** Song time in ms for a moment on the performance clock (an input event's timestamp, say). */
+const songTime = (s, at = performance.now()) => Date.now() - (performance.now() - at) - s.startAt + CONFIG.inputOffsetMs;
+/** Adds one judgement to a scorecard (yours or a bot's): combo, multiplier, score. */
+function score(st, j) {
+  if (j === "M") { st.m++; st.cb = 0; return; }
+  st[{ P: "p", G: "g", O: "o" }[j]]++; st.cb++; st.mx = Math.max(st.mx, st.cb);
+  st.sc += CONFIG.points[j] * Math.min(CONFIG.multMax, 1 + Math.floor((st.cb - 1) / CONFIG.multEvery));
+}
+/** Line up for a song: everything before "now" is skipped (not missed) if you came in late. */
+function joinSong(s) {
+  const song = songOf(s.seed), t = Date.now() - s.startAt;
+  Object.assign(me, { songId: s.id, st: blank(), judged: new Uint8Array(song.notes.length), next: [0, 0, 0, 0], late: t > 0, lastJson: "" });
+  for (let l = 0; l < 4; l++) while (me.next[l] < song.byLane[l].length && song.notes[song.byLane[l][me.next[l]]].t < t + CONFIG.good) me.next[l]++;
+  $("over").hidden = true; fx.length = 0; shown.clear(); publish(true);
+}
+/** A lane pressed at time `at`: judge the next note in that lane if it is close enough. */
+function press(lane, at) {
+  if (!(at > 0 && at <= performance.now())) at = performance.now();
+  const t0 = at;
+  unlockAudio(); // (the press time is already stamped: building the sound engine can take a moment)
+  pressed[lane] = performance.now();
+  const s = round();
+  if (!s || s.phase !== "play" || me.songId !== s.id) return;
+  const song = songOf(s.seed), list = song.byLane[lane], t = songTime(s, t0);
+  const i = me.next[lane];
+  if (i >= list.length) return;
+  const n = song.notes[list[i]], err = t - n.t;
+  if (Math.abs(err) > CONFIG.good) return; // nothing in reach: a free tap
+  const j = Math.abs(err) <= CONFIG.perfect ? "P" : Math.abs(err) <= CONFIG.great ? "G" : "O";
+  judge(list[i], lane, j, err);
+}
+function judge(idx, lane, j, err) {
+  me.judged[idx] = j === "M" ? 2 : 1; me.next[lane]++;
+  const before = me.st.cb;
+  score(me.st, j);
+  const n = songOf(round().seed).notes[idx];
+  if (j !== "M") { keysound(n, j); burst(lane, j); } else if (before >= 10) blip(220, 90, 0.25, 0.15);
+  showJudge(j, err);
+  if (me.st.cb && me.st.cb % 50 === 0) { flashText(`${me.st.cb} COMBO!`); blip(660, 1320, 0.3, 0.12); }
+  publish(j === "M" && before > 0);
+}
+/** Every frame: notes that slid past the line unhit are misses. */
+function sweepMisses(s) {
+  const song = songOf(s.seed), t = Date.now() - s.startAt;
+  for (let l = 0; l < 4; l++) {
+    const list = song.byLane[l];
+    while (me.next[l] < list.length && song.notes[list[me.next[l]]].t + CONFIG.good < t) judge(list[me.next[l]], l, "M", 0);
+  }
+}
+function publish(force) {
+  const now = performance.now(), json = JSON.stringify({ r: me.songId, ...me.st });
+  if (json === me.lastJson || (!force && now - me.lastSend < CONFIG.sendMs)) return;
+  me.lastSend = now; me.lastJson = json; net.me.set("s", json);
+}
+/** ?attract: your lanes play themselves, mostly on the beat. */
+function autopilot(s) {
+  if (!ATTRACT || s.phase !== "play" || me.songId !== s.id) return;
+  const song = songOf(s.seed), t = Date.now() - s.startAt;
+  for (let l = 0; l < 4; l++) {
+    const i = me.next[l], idx = song.byLane[l][i]; if (idx === undefined) continue;
+    const n = song.notes[idx];
+    if (n.aim === undefined) n.aim = (Math.random() - 0.4) * 70 + (Math.random() < 0.04 ? 400 : 0); // the odd miss
+    if (t >= n.t + n.aim) { pressed[l] = performance.now(); const err = t - n.t; if (Math.abs(err) <= CONFIG.good) judge(idx, l, Math.abs(err) <= CONFIG.perfect ? "P" : Math.abs(err) <= CONFIG.great ? "G" : "O", err); }
+  }
+}
+
+// ── DRAW ────────────────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const cv = $("game"), ctx = cv.getContext("2d");
+const touchUI = matchMedia("(pointer: coarse)").matches;
+let W = 0, H = 0, DPR = 1, L = {};
+function fit() {
+  DPR = Math.min(2, devicePixelRatio || 1); W = innerWidth; H = innerHeight; cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+  const portrait = H > W * 1.1, bw = portrait ? W * 0.96 : Math.min(W * 0.44, 540);
+  L = { portrait, cx: W / 2, bw, tw: bw * 0.42, topY: portrait ? H * 0.2 : H * 0.07, hitY: H - (portrait ? Math.max(120, H * 0.15) : Math.max(70, H * 0.14)) };
+  $("hint").style.top = (portrait ? H * 0.13 : H * 0.015) + "px";
+}
+addEventListener("resize", fit); addEventListener("orientationchange", fit);
+/** The highway in perspective: depth 0 = the hit line, 1 = the far end. Returns screen y and the width scale. */
+function road(depth) {
+  const p = 1.4, f = (depth * (1 + p)) / (1 + p * depth);
+  return { y: L.hitY - (L.hitY - L.topY) * f, k: 1 - (1 - L.tw / L.bw) * f };
+}
+const laneX = (lane, k) => L.cx + (lane - 1.5) * (L.bw / 4) * k;
+const pressed = [0, 0, 0, 0], fx = [], pops = [];
+let judgeText = null, bigText = null;
+function burst(lane, j) { for (let i = 0; i < (j === "P" ? 14 : 8); i++) fx.push({ x: laneX(lane, 1), y: L.hitY, vx: (Math.random() - 0.5) * 260, vy: -80 - Math.random() * 260, life: 0.5, col: LANE_COLORS[lane] }); }
+const showJudge = (j, err) => { judgeText = { j, err, at: performance.now() }; };
+const flashText = (text) => { bigText = { text, at: performance.now() }; };
+
+function draw(s, list, now, dt) {
+  const song = songOf(s.seed), t = Date.now() - s.startAt, beat = 60000 / song.bpm, bp = t > 0 ? (t % beat) / beat : 0, pulse = Math.pow(1 - bp, 3);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // stage: dark gradient, beams and rings that pulse on the beat
+  const bg = ctx.createLinearGradient(0, 0, 0, H); bg.addColorStop(0, "#140d33"); bg.addColorStop(1, "#06050f");
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+  const playing = s.phase === "play" && t > 0;
+  for (let i = 0; i < 6; i++) { // light beams sweeping from the floor
+    const a = Math.sin(now / 1400 + i * 1.3) * 0.5, x = (W * (i + 0.5)) / 6;
+    ctx.save(); ctx.translate(x, H); ctx.rotate(a); ctx.fillStyle = `rgba(${i % 2 ? "178,107,255" : "61,242,255"},${0.035 + (playing ? pulse * 0.05 : 0)})`;
+    ctx.beginPath(); ctx.moveTo(-8, 0); ctx.lineTo(-H * 0.18, -H * 1.1); ctx.lineTo(H * 0.18, -H * 1.1); ctx.lineTo(8, 0); ctx.fill(); ctx.restore();
+  }
+  if (playing) { ctx.strokeStyle = `rgba(255,255,255,${0.12 * pulse})`; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(L.cx, L.hitY, (1 - pulse) * W * 0.6 + 40, 0, Math.PI * 2); ctx.stroke(); }
+  // the highway
+  const far = road(1), nearK = 1;
+  ctx.fillStyle = "#0d0b22e6"; ctx.beginPath();
+  ctx.moveTo(L.cx - (L.bw / 2) * nearK - 6, L.hitY + 40); ctx.lineTo(L.cx - (L.bw / 2) * far.k, far.y); ctx.lineTo(L.cx + (L.bw / 2) * far.k, far.y); ctx.lineTo(L.cx + (L.bw / 2) * nearK + 6, L.hitY + 40); ctx.fill();
+  for (let l = 0; l <= 4; l++) { // lane lines
+    ctx.strokeStyle = l === 0 || l === 4 ? "#b26bff99" : "#ffffff1c"; ctx.lineWidth = l === 0 || l === 4 ? 3 : 1.5;
+    ctx.beginPath(); ctx.moveTo(L.cx + (l - 2) * (L.bw / 4), L.hitY + 40); ctx.lineTo(L.cx + (l - 2) * (L.bw / 4) * far.k, far.y); ctx.stroke();
+  }
+  for (let b = Math.ceil(t / beat); b * beat < t + CONFIG.leadMs; b++) { // beat lines rolling toward you
+    const r = road((b * beat - t) / CONFIG.leadMs); if (b * beat < t) continue;
+    ctx.strokeStyle = b % 4 === 0 ? "#ffffff33" : "#ffffff12"; ctx.lineWidth = b % 4 === 0 ? 2 : 1;
+    ctx.beginPath(); ctx.moveTo(L.cx - (L.bw / 2) * r.k, r.y); ctx.lineTo(L.cx + (L.bw / 2) * r.k, r.y); ctx.stroke();
+  }
+  // lane glow while a lane is held / just pressed
+  for (let l = 0; l < 4; l++) {
+    const age = (now - pressed[l]) / 1000; if (age > 0.25) continue;
+    const g = ctx.createLinearGradient(0, L.hitY, 0, L.hitY - (L.hitY - L.topY) * 0.6); g.addColorStop(0, LANE_COLORS[l] + "55"); g.addColorStop(1, LANE_COLORS[l] + "00");
+    ctx.globalAlpha = 1 - age / 0.25; ctx.fillStyle = g; ctx.fillRect(laneX(l, 1) - L.bw / 8, L.hitY - (L.hitY - L.topY) * 0.6, L.bw / 4, (L.hitY - L.topY) * 0.6); ctx.globalAlpha = 1;
+  }
+  // receptors on the hit line
+  const nw = L.bw / 4 * 0.78, nh = Math.max(14, nw * 0.3);
+  for (let l = 0; l < 4; l++) {
+    const x = laneX(l, 1), lit = now - pressed[l] < 120;
+    ctx.strokeStyle = LANE_COLORS[l]; ctx.lineWidth = 3; ctx.fillStyle = lit ? LANE_COLORS[l] : "#ffffff10";
+    pill(x - nw / 2, L.hitY - nh / 2, nw, nh, nh / 2); ctx.fill(); ctx.stroke();
+    if (!touchUI && !ATTRACT) { ctx.fillStyle = lit ? "#0a0818" : LANE_COLORS[l]; ctx.font = `900 ${Math.round(nh * 0.6)}px system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("DFJK"[l], x, L.hitY + 1); }
+  }
+  // notes: far ones first
+  if (s.phase !== "done") {
+    const judged = me.songId === s.id ? me.judged : null, first = lowerBound(song.notes, t - 300);
+    for (let i = first; i < song.notes.length; i++) {
+      const n = song.notes[i]; if (n.t > t + CONFIG.leadMs) break;
+      if (judged && judged[i] === 1) continue; // hit: gone (a missed note slides on past the line, grey)
+      const r = road(Math.max(-0.15, (n.t - t) / CONFIG.leadMs)), x = laneX(n.l, r.k), w = nw * r.k, h = nh * r.k;
+      const missed = (judged && judged[i] === 2) || n.t < t - CONFIG.good;
+      ctx.shadowColor = LANE_COLORS[n.l]; ctx.shadowBlur = missed ? 0 : 12 * r.k;
+      ctx.fillStyle = missed ? "#55506a" : LANE_COLORS[n.l]; pill(x - w / 2, r.y - h / 2, w, h, h / 2); ctx.fill();
+      ctx.shadowBlur = 0; ctx.fillStyle = "#ffffffaa"; pill(x - w * 0.36, r.y - h * 0.32, w * 0.72, h * 0.22, h * 0.11); ctx.fill();
+    }
+  }
+  // sparks
+  for (let i = fx.length - 1; i >= 0; i--) {
+    const p = fx[i]; p.life -= dt; if (p.life <= 0) { fx.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 600 * dt;
+    ctx.globalAlpha = p.life * 2; ctx.fillStyle = p.col; ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+  }
+  ctx.globalAlpha = 1;
+  // the judgement, the combo and the multiplier, in the middle of the highway
+  const mid = L.topY + (L.hitY - L.topY) * 0.55;
+  if (judgeText && now - judgeText.at < 450) {
+    const a = 1 - (now - judgeText.at) / 450, sc = 1 + Math.max(0, 0.12 - (now - judgeText.at) / 1000) * 3;
+    const [label, col] = { P: ["PERFECT", "#7dff6a"], G: ["GREAT", "#3df2ff"], O: ["GOOD", "#ffd23f"], M: ["MISS", "#ff4d6d"] }[judgeText.j];
+    ctx.globalAlpha = a; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.font = `900 ${Math.round(Math.min(44, L.bw * 0.1) * sc)}px system-ui, sans-serif`;
+    ctx.lineWidth = 5; ctx.strokeStyle = "#0a0818"; ctx.strokeText(label, L.cx, mid + 66); ctx.fillStyle = col; ctx.fillText(label, L.cx, mid + 66); ctx.globalAlpha = 1;
+  }
+  if (me.songId === s.id && me.st.cb >= 3 && s.phase === "play") {
+    const mult = Math.min(CONFIG.multMax, 1 + Math.floor((me.st.cb - 1) / CONFIG.multEvery));
+    ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = `rgba(255,255,255,${0.55 + pulse * 0.25})`;
+    ctx.font = `900 ${Math.round(Math.min(64, L.bw * 0.15) * (1 + pulse * 0.06))}px system-ui, sans-serif`; ctx.fillText(String(me.st.cb), L.cx, mid - 10);
+    ctx.font = `800 ${Math.round(Math.min(16, L.bw * 0.04))}px system-ui, sans-serif`; ctx.fillStyle = mult > 1 ? "#ffd23f" : "#ffffff99"; ctx.fillText(`COMBO${mult > 1 ? `  ×${mult}` : ""}`, L.cx, mid + 18);
+  }
+  if (bigText && now - bigText.at < 900) { ctx.globalAlpha = 1 - (now - bigText.at) / 900; ctx.font = `900 ${Math.round(Math.min(40, L.bw * 0.09))}px system-ui, sans-serif`; ctx.fillStyle = "#ffd23f"; ctx.fillText(bigText.text, L.cx, mid - 70); ctx.globalAlpha = 1; }
+  // count-in
+  if (t < 0 && s.phase !== "done") { const n = Math.ceil(-t / 1000); ctx.font = `900 ${Math.round(Math.min(120, L.bw * 0.3))}px system-ui, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillStyle = "#ffd23f"; ctx.fillText(n > 3 ? "" : String(n), L.cx, mid); }
+  drawBoard(s, list, song, t, now);
+}
+const lowerBound = (a, t) => { let lo = 0, hi = a.length; while (lo < hi) { const m = (lo + hi) >> 1; if (a[m].t < t) lo = m + 1; else hi = m; } return lo; };
+function pill(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect ? ctx.roundRect(x, y, w, h, r) : ctx.rect(x, y, w, h); }
+
+/** Everyone's score, ranked: a column beside the highway on wide screens, a strip on top on phones. */
+const shown = new Map(); // id -> { sc (eased), hits, flash }
+function drawBoard(s, list, song, t, now) {
+  const pad = 14, top = Math.max(12, L.portrait ? 10 : 14);
+  ctx.textBaseline = "middle";
+  // song name and progress
+  const prog = Math.max(0, Math.min(1, t / song.length));
+  if (!ATTRACT) {
+    ctx.font = "800 13px system-ui, sans-serif"; ctx.textAlign = L.portrait ? "left" : "right"; ctx.fillStyle = "#a59fc9";
+    const label = `♪ ${song.name} · ${song.bpm} BPM`;
+    if (L.portrait) ctx.fillText(label, pad, top + 8); else ctx.fillText(label, W - pad, top + 8);
+  }
+  ctx.fillStyle = "#ffffff18"; ctx.fillRect(L.cx - L.bw / 2, L.hitY + 46, L.bw, 4); ctx.fillStyle = "#b26bff"; ctx.fillRect(L.cx - L.bw / 2, L.hitY + 46, L.bw * prog, 4);
+  const cardW = L.portrait ? (W - pad * 2 - 6 * (list.length - 1)) / Math.max(1, list.length) : Math.min(230, L.cx - L.bw / 2 - pad * 2);
+  list.forEach((p, i) => {
+    let v = shown.get(p.id); if (!v) { v = { sc: p.sc, hits: p.p + p.g + p.o, flash: 0 }; shown.set(p.id, v); }
+    v.sc += (p.sc - v.sc) * 0.2; if (Math.abs(p.sc - v.sc) < 1) v.sc = p.sc;
+    const hits = p.p + p.g + p.o; if (hits > v.hits) v.flash = now; v.hits = hits;
+    const x = L.portrait ? pad + i * (cardW + 6) : pad, y = L.portrait ? top + 22 : top + 34 + i * 62, h = L.portrait ? 50 : 54;
+    if (cardW < 60) return;
+    const glow = Math.max(0, 1 - (now - v.flash) / 220);
+    ctx.fillStyle = p.mine ? "#2a1f55" : "#17122f"; pill(x, y, cardW, h, 10); ctx.fill();
+    ctx.strokeStyle = p.color; ctx.globalAlpha = 0.35 + glow * 0.65; ctx.lineWidth = p.mine ? 2.5 : 1.5; ctx.stroke(); ctx.globalAlpha = 1;
+    ctx.fillStyle = p.color; pill(x, y, 5, h, 2.5); ctx.fill();
+    ctx.textAlign = "left"; ctx.font = `800 ${L.portrait ? 11 : 13}px system-ui, sans-serif`; ctx.fillStyle = p.mine ? "#ffd23f" : "#f4f0ff";
+    const name = `${i + 1}. ${p.mine ? "You" : p.name}`; ctx.fillText(name.length > 16 ? name.slice(0, 15) + "…" : name, x + 11, y + 15);
+    ctx.font = `900 ${L.portrait ? 15 : 19}px ui-monospace, Menlo, Consolas, monospace`; ctx.fillStyle = "#f4f0ff"; ctx.fillText(Math.round(v.sc).toLocaleString("en-US"), x + 11, y + h - 15);
+    if (p.cb >= 5 && cardW > 110) { ctx.textAlign = "right"; ctx.font = "800 12px system-ui, sans-serif"; ctx.fillStyle = p.cb >= 30 ? "#ffd23f" : "#a59fc9"; ctx.fillText(`${p.cb}×`, x + cardW - 8, y + 15); }
+  });
+  // wide screens: your multiplier, accuracy and best combo on the right
+  const mine = list.find((p) => p.mine), rx = (L.cx + L.bw / 2 + W) / 2;
+  if (!L.portrait && mine && W - (L.cx + L.bw / 2) > 140) {
+    const mult = Math.min(CONFIG.multMax, 1 + Math.floor(Math.max(0, mine.cb - 1) / CONFIG.multEvery));
+    [["MULTIPLIER", `×${mult}`, mult > 1 ? "#ffd23f" : "#f4f0ff"], ["ACCURACY", `${accuracy(mine)}%`, "#f4f0ff"], ["BEST COMBO", String(mine.mx), "#f4f0ff"]].forEach(([label, val, col], i) => {
+      const y = H * 0.3 + i * 74; ctx.textAlign = "center";
+      ctx.font = "700 11px system-ui, sans-serif"; ctx.fillStyle = "#a59fc9"; ctx.fillText(label, rx, y);
+      ctx.font = `900 ${i ? 26 : 34}px ui-monospace, Menlo, Consolas, monospace`; ctx.fillStyle = col; ctx.fillText(val, rx, y + 26);
+    });
+  }
+}
+
+// ── HUD & RESULTS ───────────────────────────────────────────────────────────────────
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let board = null, boardFor = -1;
+function hud(s, list) {
+  const t = Date.now(), st = t - s.startAt;
+  if (ATTRACT) { $("net").textContent = ""; $("hint").textContent = ""; $("over").hidden = true; return; }
+  const n = livePlayers().length;
+  $("net").textContent = netDown ? "Reconnecting…" : net.offline ? "Offline: playing with bots" : `Online · ${n} player${n === 1 ? "" : "s"}${isHost() ? " · you run the round" : ""}`;
+  const how = touchUI ? "Tap the lanes" : "Press D F J K";
+  $("hint").textContent = s.phase === "count" ? `${how} as each note hits the line.${audio ? "" : touchUI ? " Tap for sound." : " Press a key for sound."}`
+    : s.phase === "play" && st < 4000 ? (me.late ? "You joined mid-song: play from here!" : `${how} on the beat!`) : s.phase === "play" && !audio ? (touchUI ? "Tap a lane to turn the music on" : "Press a key to turn the music on") : "";
+  $("over").hidden = s.phase !== "done";
+  if (s.phase === "done") {
+    const top = s.res[0], combo = [...s.res].sort((a, b) => b[4] - a[4])[0];
+    $("winner").textContent = !top ? "Song over" : top[0] === net.sessionId ? "You win!" : `${top[1]} wins!`;
+    $("combo").textContent = combo && combo[4] ? `Longest combo: ${combo[0] === net.sessionId ? "you" : combo[1]}, ${combo[4]} in a row` : "";
+    $("results").innerHTML = s.res.map(([id, name, color, sc, mx, acc, p]) => `<li class="${id === net.sessionId ? "me" : ""}"><b style="color:${esc(color)}">●</b> ${esc(name)}<span>${sc.toLocaleString("en-US")}</span><small>best combo ${mx} · ${acc}% accuracy · ${p} perfect</small></li>`).join("");
+    $("again").textContent = me.ready === s.id ? "Waiting for the others…" : "Play again";
+    $("next").textContent = `Next song in ${Math.max(0, Math.ceil((s.endsAt - t) / 1000))}s`;
+    if (boardFor !== s.id) { boardFor = s.id; showBoard(s); }
+  }
+}
+function showBoard(s) {
+  const list = $("board");
+  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
+  list.innerHTML = "<li>Loading…</li>";
+  const mine = me.songId === s.id && me.submitted !== s.id ? me.st.sc : 0;
+  me.submitted = s.id;
+  (mine ? board.submit(mine).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${Number(e.score).toLocaleString("en-US")}</span></li>`).join("") : "<li>No scores yet. Set the first.</li>";
+  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+}
+function playAgain() { const s = round(); if (s && s.phase === "done") { me.ready = s.id; net.me.set("rdy", s.id); $("again").textContent = "Waiting for the others…"; } }
+$("again").onclick = playAgain;
+
+// ── INPUT ───────────────────────────────────────────────────────────────────────────
+addEventListener("keydown", (e) => {
+  if (e.repeat || e.ctrlKey || e.metaKey) return;
+  const lane = KEYS[e.key.toLowerCase()];
+  if (lane !== undefined) { e.preventDefault(); press(lane, e.timeStamp); }
+  else if (e.key === " " || e.key === "Enter") { unlockAudio(); if (round()?.phase === "done") playAgain(); }
+});
+cv.addEventListener("pointerdown", (e) => { // each finger is its own press: chords work on touch
+  e.preventDefault();
+  const lane = Math.max(0, Math.min(3, Math.floor(((e.clientX - (L.cx - L.bw / 2)) / L.bw) * 4)));
+  press(lane, e.timeStamp);
+});
+document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+
+// ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
+let last = performance.now(), lastHb = 0, lastHud = 0;
+function frame(now) {
+  const dt = Math.max(0, Math.min(0.05, (now - last) / 1000)); last = now; // the first frame can be stamped before `last`
+  if (now - lastHb > 1000) { lastHb = now; net.me.set("hb", Date.now()); fixColor(); }
+  if (isHost()) hostTick(now); else host.wasHost = false;
+  const s = round();
+  if (s) {
+    if (s.phase !== "done" && me.songId !== s.id) joinSong(s); // a new song, or you just arrived: line up
+    if (s.phase === "play" && me.songId === s.id) { autopilot(s); sweepMisses(s); publish(false); }
+    scheduleMusic(s, now);
+    const list = players(s);
+    draw(s, list, now, dt);
+    if (now - lastHud > 100) { lastHud = now; hud(s, list); }
+  } else { ctx.setTransform(DPR, 0, 0, DPR, 0, 0); ctx.fillStyle = "#0a0818"; ctx.fillRect(0, 0, W, H); }
+  requestAnimationFrame(frame);
+}
+/** Two players picked the same color at once (the joiner's first state can be empty): the later sessionId picks again. */
+function fixColor() {
+  const others = Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId), bots = botColors();
+  if (!others.some(([id, p]) => p.c === myColor && id < net.sessionId) && !bots.includes(myColor)) return; // a bot in your color: you change
+  const taken = new Set([...others.map(([, p]) => p.c), ...bots]), free = COLORS.find((c) => !taken.has(c));
+  if (free) { myColor = free; net.me.set("c", free); }
+}
+
+(async function start() {
+  fit();
+  net = await connect();
+  net.onState((st) => { S = st; });
+  net.onDisconnect(() => { netDown = true; $("net").textContent = "Reconnecting…"; });
+  net.onReconnect(() => { netDown = false; });
+  if (!net.offline && typeof MP !== "undefined") board = MP.auth({ key: MP_CONNECT.key, apiUrl: MP_CONNECT.apiUrl }).leaderboard(CONFIG.board);
+  const taken = new Set([...Object.entries(S.entities.players || {}).filter(([id]) => id !== net.sessionId).map(([, p]) => p.c), ...botColors()]);
+  myColor = COLORS.find((c) => !taken.has(c)) || COLORS[Math.floor(Math.random() * COLORS.length)];
+  net.me.set({ n: myName, c: myColor, hb: Date.now() });
+  if (ATTRACT) Object.assign(CONFIG, { countdown: 600, resultsMs: 1500, botSkill: [0.65, 0.9] });
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
