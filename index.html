@@ -20,6 +20,7 @@
   .card h3 { margin: 14px 0 4px; font-size: 14px; color: var(--gold); text-align: left; }
   .card ol { margin: 0; padding-left: 24px; font-size: 14px; text-align: left; }
   .card li { padding: 2px 0; } .card li span { float: right; font-variant-numeric: tabular-nums; }
+  .card li.msg { list-style: none; margin-left: -24px; color: var(--dim); } /* a status line, not a numbered entry */
   .card li small { display: block; color: var(--dim); font-size: 12px; }
   .card li.me { color: var(--gold); font-weight: 700; }
   .card p { margin: 10px 0 0; font-size: 13px; opacity: .8; }
@@ -33,7 +34,7 @@
 <div class="hud" id="net">Connecting…</div>
 <div id="over" hidden><div class="card">
   <h2 id="winner"></h2><div class="sub" id="combo"></div><ol id="results"></ol>
-  <h3>High scores</h3><ol id="board"><li>Loading…</li></ol>
+  <h3>High scores</h3><ol id="board"><li class="msg">Loading…</li></ol>
   <button class="go" id="again">Play again</button><p id="next"></p>
 </div></div>
 <script>
@@ -80,6 +81,7 @@ const CONFIG = {
   perfect: 50,          // ms either side of the beat for PERFECT...
   great: 95,            // ...GREAT...
   good: 140,            // ...and GOOD; later than this is a miss
+  earlyMiss: 230,       // a press this early (but outside GOOD) misses the note, so mashing the keys doesn't pay
   points: { P: 300, G: 200, O: 100, M: 0 }, // per hit, times the combo multiplier
   multEvery: 10,        // the multiplier goes up every this many hits in a row...
   multMax: 4,           // ...up to this
@@ -157,6 +159,7 @@ const CHORD = { 0: [0, 3, 7], 3: [3, 7, 10], 5: [5, 8, 12], 7: [7, 11, 14], 8: [
 const SCALE = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22]; // two octaves of minor pentatonic: the melody's notes, low to high
 // each section: bars, how busy the notes are (0 = none: the count-in groove), drums
 const SECTIONS = [{ bars: 2, dens: 0 }, { bars: 4, dens: 1 }, { bars: 4, dens: 2 }, { bars: 4, dens: 1.5 }, { bars: 4, dens: 3 }];
+const densAt = (bar) => { let b = 0; for (const s of SECTIONS) { if (bar < b + s.bars) return s.dens; b += s.bars; } return 2; };
 const songMemo = new Map();
 /** The whole song from its seed: tempo, music events and the note chart. Everyone builds the same one. */
 function songOf(seed) {
@@ -291,7 +294,8 @@ function driveBots(s) {
   for (const b of host.bots) {
     if (!b.ni) while (b.ni < chart.length && chart[b.ni].t < t - CONFIG.good) b.ni++; // a bot added mid-song starts here
     while (b.ni < chart.length && chart[b.ni].t + 40 <= t) {
-      const r = Math.random(), miss = (1 - b.k) * 0.3, perf = b.k * 0.62;
+      const busy = densAt(Math.floor(chart[b.ni].t / (16 * songOf(s.seed).step))) / 3; // 0.33 (easy) .. 1 (busiest)
+      const r = Math.random(), miss = (1 - b.k) * 0.3 * (0.5 + busy) + (b.m && b.cb === 0 ? 0.12 : 0), perf = b.k * 0.62; // a miss can throw it off the next note too
       score(b, r < miss ? "M" : r < miss + perf ? "P" : r < miss + perf + 0.22 ? "G" : "O");
       b.ni++;
     }
@@ -364,6 +368,7 @@ function press(lane, at) {
   const i = me.next[lane];
   if (i >= list.length) return;
   const n = song.notes[list[i]], err = t - n.t;
+  if (err < -CONFIG.good && err >= -CONFIG.earlyMiss) return judge(list[i], lane, "M", err); // far too early: that note is missed
   if (Math.abs(err) > CONFIG.good) return; // nothing in reach: a free tap
   const j = Math.abs(err) <= CONFIG.perfect ? "P" : Math.abs(err) <= CONFIG.great ? "G" : "O";
   judge(list[i], lane, j, err);
@@ -574,13 +579,13 @@ function hud(s, list) {
 }
 function showBoard(s) {
   const list = $("board");
-  if (!board) { list.innerHTML = "<li>Leaderboards need a connection.</li>"; return; }
-  list.innerHTML = "<li>Loading…</li>";
+  if (!board) { list.innerHTML = '<li class="msg">Leaderboards need a connection.</li>'; return; }
+  list.innerHTML = '<li class="msg">Loading…</li>';
   const mine = me.songId === s.id && me.submitted !== s.id ? me.st.sc : 0;
   me.submitted = s.id;
   (mine ? board.submit(mine).catch(() => null) : Promise.resolve()).then(() => board.top(10)).then(({ entries }) => {
-    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${Number(e.score).toLocaleString("en-US")}</span></li>`).join("") : "<li>No scores yet. Set the first.</li>";
-  }).catch(() => { list.innerHTML = "<li>Couldn't load the leaderboard.</li>"; });
+    list.innerHTML = entries.length ? entries.map((e) => `<li>${esc(e.username || "Player")}<span>${Number(e.score).toLocaleString("en-US")}</span></li>`).join("") : '<li class="msg">No scores yet. Set the first.</li>';
+  }).catch(() => { list.innerHTML = `<li class="msg">Couldn't load the leaderboard.</li>`; });
 }
 function playAgain() { const s = round(); if (s && s.phase === "done") { me.ready = s.id; net.me.set("rdy", s.id); $("again").textContent = "Waiting for the others…"; } }
 $("again").onclick = playAgain;
@@ -594,9 +599,11 @@ addEventListener("keydown", (e) => {
 });
 cv.addEventListener("pointerdown", (e) => { // each finger is its own press: chords work on touch
   e.preventDefault();
+  if (e.button > 0) return; // right or middle click: not a tap
   const lane = Math.max(0, Math.min(3, Math.floor(((e.clientX - (L.cx - L.bw / 2)) / L.bw) * 4)));
   press(lane, e.timeStamp);
 });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
 
 // ── MAIN LOOP ───────────────────────────────────────────────────────────────────────
